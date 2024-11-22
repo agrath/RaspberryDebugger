@@ -16,6 +16,7 @@
 // limitations under the License.
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Diagnostics.Contracts;
 using System.IO;
 using System.Linq;
@@ -41,6 +42,9 @@ namespace RaspberryDebugger.Connection
     /// </summary>
     internal class Connection : LinuxSshProxy
     {
+        //define this to capture ssh connection logs, e.g. if your private public key auth is failing
+        //PubkeyAcceptedKeyTypes=+ssh-rsa needed on pi4b
+        static DebugTextWriterLogger DebugWriter = null;// new DebugTextWriterLogger();
         //---------------------------------------------------------------------
         // Static members
 
@@ -87,13 +91,13 @@ namespace RaspberryDebugger.Connection
                 else
                 {
                     Log($"[{connectionInfo.Host}]: Auth via SSH keys");
+                    Log($"[{connectionInfo.Host}]: Using {connectionInfo.User} and key file {connectionInfo.PrivateKeyPath}");
 
                     credentials = SshCredentials.FromPrivateKey(connectionInfo.User, File.ReadAllText(connectionInfo.PrivateKeyPath));
                 }
 
-                var connection = new Connection(connectionInfo?.Host, address, connectionInfo, credentials, projectSettings);
-
-                connection.Connect(TimeSpan.Zero);
+                Connection connection = new Connection(connectionInfo?.Host, address, connectionInfo, credentials, projectSettings, logWriter: DebugWriter);
+                connection.Connect(TimeSpan.FromSeconds(30));
                 await connection.InitializeAsync();
 
                 return connection;
@@ -133,8 +137,8 @@ namespace RaspberryDebugger.Connection
                     RaspberryDebugger.Log.Info($"[{connectionInfo.Host}]: Reauthorizing the public key");
 
                     var homeFolder = LinuxPath.Combine("/", "home", connectionInfo.User);
-                    var publicKey  = File.ReadAllText(connectionInfo.PublicKeyPath).Trim();
-                    var keyScript  =
+                    var publicKey = File.ReadAllText(connectionInfo.PublicKeyPath).Trim();
+                    var keyScript =
                         $@"
                         mkdir -p {homeFolder}/.ssh
                         touch {homeFolder}/.ssh/authorized_keys
@@ -166,6 +170,39 @@ namespace RaspberryDebugger.Connection
             }
         }
 
+        public class DebugTextWriterLogger : StreamWriter
+        {
+            public DebugTextWriterLogger()
+                : base(new DebugOutStream(), System.Text.Encoding.Unicode, 1024)
+            {
+                this.AutoFlush = true;
+            }
+
+            sealed class DebugOutStream : Stream
+            {
+                public override void Write(byte[] buffer, int offset, int count)
+                {
+                    Log(System.Text.Encoding.Unicode.GetString(buffer, offset, count));
+                }
+
+                public override bool CanRead => false;
+                public override bool CanSeek => false;
+                public override bool CanWrite => true;
+                public override void Flush() => Debug.Flush();
+
+                public override long Length => throw bad_op;
+                public override int Read(byte[] buffer, int offset, int count) => throw bad_op;
+                public override long Seek(long offset, SeekOrigin origin) => throw bad_op;
+                public override void SetLength(long value) => throw bad_op;
+                public override long Position
+                {
+                    get => throw bad_op;
+                    set => throw bad_op;
+                }
+
+                static InvalidOperationException bad_op => new InvalidOperationException();
+            };
+        }
         /// <summary>
         /// Logs a line of text to the Visual Studio debug pane.
         /// </summary>
@@ -185,7 +222,7 @@ namespace RaspberryDebugger.Connection
         //---------------------------------------------------------------------
         // Instance members
 
-        private readonly ConnectionInfo  connectionInfo;
+        private readonly ConnectionInfo connectionInfo;
         private readonly ProjectSettings projectSettings;
 
         /// <summary>
@@ -200,10 +237,10 @@ namespace RaspberryDebugger.Connection
         /// will be used for remote debugging but may be omitted for connections just used for setting
         /// things up like SSH keys, etc.
         /// </param>
-        private Connection(string name, IPAddress address, ConnectionInfo connectionInfo, SshCredentials credentials, ProjectSettings projectSettings)
-            : base(name, address, credentials, connectionInfo.Port, logWriter: null)
+        private Connection(string name, IPAddress address, ConnectionInfo connectionInfo, SshCredentials credentials, ProjectSettings projectSettings, TextWriter logWriter = null)
+            : base(name, address, credentials, connectionInfo.Port, logWriter: logWriter)
         {
-            this.connectionInfo  = connectionInfo;
+            this.connectionInfo = connectionInfo;
             this.projectSettings = projectSettings;
 
             // Disable connection level logging, etc.
@@ -395,13 +432,13 @@ namespace RaspberryDebugger.Connection
                     // ReSharper disable once ConvertToUsingDeclaration
                     using (var reader = new StringReader(response.OutputText))
                     {
-                        var processor    = await reader.ReadLineAsync();
-                        var path         = await reader.ReadLineAsync();
-                        var hasUnzip     = await reader.ReadLineAsync() == "unzip";
-                        var hasDebugger  = await reader.ReadLineAsync() == "debugger-installed";
-                        var sdkLine      = await reader.ReadLineAsync();
-                        var model        = await reader.ReadLineAsync();
-                        var revision     = await reader.ReadToEndAsync();
+                        var processor = await reader.ReadLineAsync();
+                        var path = await reader.ReadLineAsync();
+                        var hasUnzip = await reader.ReadLineAsync() == "unzip";
+                        var hasDebugger = await reader.ReadLineAsync() == "debugger-installed";
+                        var sdkLine = await reader.ReadLineAsync();
+                        var model = await reader.ReadLineAsync();
+                        var revision = await reader.ReadToEndAsync();
 
                         revision = revision.Trim();     // Remove any whitespace at the end.
 
@@ -446,14 +483,14 @@ namespace RaspberryDebugger.Connection
                         }
 
                         PiStatus = new Status(
-                            processor:     processor,
-                            path:          path,
-                            hasUnzip:      hasUnzip,
-                            hasDebugger:   hasDebugger,
+                            processor: processor,
+                            path: path,
+                            hasUnzip: hasUnzip,
+                            hasDebugger: hasDebugger,
                             installedSdks: sdks,
-                            model:         model,
-                            revision:      revision,
-                            architecture:  osBitness
+                            model: model,
+                            revision: revision,
+                            architecture: osBitness
                         );
                     }
                 });
@@ -470,12 +507,12 @@ namespace RaspberryDebugger.Connection
 
                         LogInfo("Creating SSH keys");
 
-                        var workstationUser    = Environment.GetEnvironmentVariable("USERNAME");
-                        var workstationName    = Environment.GetEnvironmentVariable("COMPUTERNAME");
-                        var keyName            = Guid.NewGuid().ToString("d");
-                        var homeFolder         = LinuxPath.Combine("/", "home", connectionInfo.User);
+                        var workstationUser = Environment.GetEnvironmentVariable("USERNAME");
+                        var workstationName = Environment.GetEnvironmentVariable("COMPUTERNAME");
+                        var keyName = Guid.NewGuid().ToString("d");
+                        var homeFolder = LinuxPath.Combine("/", "home", connectionInfo.User);
                         var tempPrivateKeyPath = LinuxPath.Combine(homeFolder, keyName);
-                        var tempPublicKeyPath  = LinuxPath.Combine(homeFolder, $"{keyName}.pub");
+                        var tempPublicKeyPath = LinuxPath.Combine(homeFolder, $"{keyName}.pub");
 
                         try
                         {
@@ -498,21 +535,21 @@ namespace RaspberryDebugger.Connection
 
                             // Download the public and private keys, persist them to the workstation
                             // and then update the connection info.
-                            var connections            = PackageHelper.ReadConnections();
+                            var connections = PackageHelper.ReadConnections();
                             var existingConnectionInfo = connections.SingleOrDefault(c => c.Name == connectionInfo.Name);
-                            var publicKeyPath          = Path.Combine(PackageHelper.KeysFolder, $"{connectionInfo.Name}.pub");
-                            var privateKeyPath         = Path.Combine(PackageHelper.KeysFolder, connectionInfo.Name);
+                            var publicKeyPath = Path.Combine(PackageHelper.KeysFolder, $"{connectionInfo.Name}.pub");
+                            var privateKeyPath = Path.Combine(PackageHelper.KeysFolder, connectionInfo.Name);
 
                             File.WriteAllBytes(publicKeyPath, DownloadBytes(tempPublicKeyPath));
                             File.WriteAllBytes(privateKeyPath, DownloadBytes(tempPrivateKeyPath));
 
                             connectionInfo.PrivateKeyPath = privateKeyPath;
-                            connectionInfo.PublicKeyPath  = publicKeyPath;
+                            connectionInfo.PublicKeyPath = publicKeyPath;
 
                             if (existingConnectionInfo != null)
                             {
                                 existingConnectionInfo.PrivateKeyPath = privateKeyPath;
-                                existingConnectionInfo.PublicKeyPath  = publicKeyPath;
+                                existingConnectionInfo.PublicKeyPath = publicKeyPath;
 
                                 PackageHelper.WriteConnections(connections, disableLogging: true);
                             }
@@ -544,7 +581,7 @@ namespace RaspberryDebugger.Connection
 
             var targetSdk = ReadActualSdkCatalogItem();
 
-            return await DownloadSdkAsync(targetSdk) && 
+            return await DownloadSdkAsync(targetSdk) &&
                    await InstallSdkAsync(targetSdk);
         }
 
@@ -570,8 +607,8 @@ namespace RaspberryDebugger.Connection
 
             // Install the SDK.
             LogInfo($"Downlaoding SDK v{targetSdk.Release}");
-            
-            var downloadSdkInfo = 
+
+            var downloadSdkInfo =
                 $"Download SDK for .NET v{targetSdk.Release} " +
                 $"({targetSdk.Architecture.GetAttributeOfType<EnumMemberAttribute>().Value}) on Raspberry...";
 
@@ -635,8 +672,8 @@ namespace RaspberryDebugger.Connection
         {
             // Install the SDK.
             LogInfo($"Installing SDK v{targetSdk.Release}");
-            
-            var installSdkInfo = 
+
+            var installSdkInfo =
                 $"Install SDK for .NET v{targetSdk.Release} " +
                 $"({targetSdk.Architecture.GetAttributeOfType<EnumMemberAttribute>().Value}) on Raspberry...";
 
@@ -714,7 +751,7 @@ namespace RaspberryDebugger.Connection
             var sdkOnPiVersion = sdkOnPi?.Name ?? string.Empty;
             var sdkOnPiArchitecture = sdkOnPi?.Architecture ?? PiStatus.Architecture;
 
-            return PiStatus.InstalledSdks.Any(sdk => sdk.Name == sdkOnPiVersion && 
+            return PiStatus.InstalledSdks.Any(sdk => sdk.Name == sdkOnPiVersion &&
                                                      sdk.Architecture == sdkOnPiArchitecture);
         }
 
